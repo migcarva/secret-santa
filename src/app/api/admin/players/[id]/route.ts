@@ -21,7 +21,7 @@ export async function DELETE(
     return NextResponse.json({ error: "Invalid player ID" }, { status: 400 });
   }
 
-  const result = deletePlayer(playerId);
+  const result = await deletePlayer(playerId);
 
   if (!result.success) {
     return NextResponse.json({ error: result.error }, { status: 400 });
@@ -50,7 +50,7 @@ export async function PATCH(
 
     // Update name/pin if provided
     if (name || pin) {
-      const playerResult = updatePlayer(playerId, { name, pin });
+      const playerResult = await updatePlayer(playerId, { name, pin });
       if (!playerResult.success) {
         return NextResponse.json({ error: playerResult.error }, { status: 400 });
       }
@@ -62,7 +62,7 @@ export async function PATCH(
         ? incompatibleIds.filter((id): id is number => typeof id === "number")
         : [];
 
-      const result = updatePlayerIncompatibilities(playerId, ids);
+      const result = await updatePlayerIncompatibilities(playerId, ids);
       if (!result.success) {
         return NextResponse.json({ error: result.error }, { status: 400 });
       }

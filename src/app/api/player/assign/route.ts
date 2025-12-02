@@ -12,7 +12,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const player = getPlayerByPin(pin);
+    const player = await getPlayerByPin(pin);
 
     if (!player) {
       return NextResponse.json(
@@ -21,7 +21,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = assignSecretSanta(player.id);
+    const result = await assignSecretSanta(player.id);
 
     if (!result.success) {
       return NextResponse.json(

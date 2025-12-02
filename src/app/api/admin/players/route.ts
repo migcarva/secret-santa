@@ -17,7 +17,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const players = getPlayersForAdmin();
+  const players = await getPlayersForAdmin();
   return NextResponse.json(players);
 }
 
@@ -44,7 +44,7 @@ export async function POST(request: Request) {
       );
     }
 
-    if (isPinTaken(pin)) {
+    if (await isPinTaken(pin)) {
       return NextResponse.json(
         { error: "This PIN is already in use" },
         { status: 400 }
@@ -55,7 +55,7 @@ export async function POST(request: Request) {
       ? incompatibleIds.filter((id): id is number => typeof id === "number")
       : [];
 
-    const player = createPlayer(name.trim(), pin, ids);
+    const player = await createPlayer(name.trim(), pin, ids);
     return NextResponse.json(player, { status: 201 });
   } catch (error) {
     console.error("Error creating player:", error);

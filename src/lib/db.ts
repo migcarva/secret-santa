@@ -1,70 +1,109 @@
-import Database from "better-sqlite3";
-import path from "path";
+import { createClient } from "@libsql/client";
 import type {
   Player,
   PlayerWithSecret,
   AdminPlayerView,
 } from "./types";
 
-const DB_PATH = process.env.DATABASE_PATH || "./data/secret-santa.db";
-
-// Ensure absolute path
-const dbPath = path.isAbsolute(DB_PATH)
-  ? DB_PATH
-  : path.join(process.cwd(), DB_PATH);
-
-// Create database connection
-const db = new Database(dbPath);
-
-// Enable foreign keys
-db.pragma("foreign_keys = ON");
+// Create database client
+// For Turso: use TURSO_DATABASE_URL and TURSO_AUTH_TOKEN
+// For local: use file:./data/local.db
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || "file:./data/local.db",
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
 // Initialize schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS players (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    pin TEXT NOT NULL UNIQUE,
-    secret_player_id INTEGER,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (secret_player_id) REFERENCES players(id)
-  );
+async function initSchema() {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS players (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      pin TEXT NOT NULL UNIQUE,
+      secret_player_id INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (secret_player_id) REFERENCES players(id)
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS incompatibilities (
-    player_id INTEGER NOT NULL,
-    incompatible_with_id INTEGER NOT NULL,
-    PRIMARY KEY (player_id, incompatible_with_id),
-    FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
-    FOREIGN KEY (incompatible_with_id) REFERENCES players(id) ON DELETE CASCADE
-  );
-`);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS incompatibilities (
+      player_id INTEGER NOT NULL,
+      incompatible_with_id INTEGER NOT NULL,
+      PRIMARY KEY (player_id, incompatible_with_id),
+      FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
+      FOREIGN KEY (incompatible_with_id) REFERENCES players(id) ON DELETE CASCADE
+    )
+  `);
+}
+
+// Initialize on first import
+const schemaInitialized = initSchema();
 
 // ============ Player Queries ============
 
-export function getPlayerByPin(pin: string): PlayerWithSecret | null {
-  const stmt = db.prepare(`
-    SELECT
-      p.*,
-      sp.name as secret_player_name
-    FROM players p
-    LEFT JOIN players sp ON p.secret_player_id = sp.id
-    WHERE p.pin = ?
-  `);
-  return stmt.get(pin) as PlayerWithSecret | null;
+export async function getPlayerByPin(pin: string): Promise<PlayerWithSecret | null> {
+  await schemaInitialized;
+  const result = await db.execute({
+    sql: `
+      SELECT
+        p.*,
+        sp.name as secret_player_name
+      FROM players p
+      LEFT JOIN players sp ON p.secret_player_id = sp.id
+      WHERE p.pin = ?
+    `,
+    args: [pin],
+  });
+
+  if (result.rows.length === 0) return null;
+
+  const row = result.rows[0];
+  return {
+    id: row.id as number,
+    name: row.name as string,
+    pin: row.pin as string,
+    secret_player_id: row.secret_player_id as number | null,
+    created_at: row.created_at as string,
+    secret_player_name: row.secret_player_name as string | null,
+  };
 }
 
-export function getPlayerById(id: number): Player | null {
-  const stmt = db.prepare("SELECT * FROM players WHERE id = ?");
-  return stmt.get(id) as Player | null;
+export async function getPlayerById(id: number): Promise<Player | null> {
+  await schemaInitialized;
+  const result = await db.execute({
+    sql: "SELECT * FROM players WHERE id = ?",
+    args: [id],
+  });
+
+  if (result.rows.length === 0) return null;
+
+  const row = result.rows[0];
+  return {
+    id: row.id as number,
+    name: row.name as string,
+    pin: row.pin as string,
+    secret_player_id: row.secret_player_id as number | null,
+    created_at: row.created_at as string,
+  };
 }
 
-export function getAllPlayers(): Player[] {
-  const stmt = db.prepare("SELECT * FROM players ORDER BY name");
-  return stmt.all() as Player[];
+export async function getAllPlayers(): Promise<Player[]> {
+  await schemaInitialized;
+  const result = await db.execute("SELECT * FROM players ORDER BY name");
+
+  return result.rows.map((row) => ({
+    id: row.id as number,
+    name: row.name as string,
+    pin: row.pin as string,
+    secret_player_id: row.secret_player_id as number | null,
+    created_at: row.created_at as string,
+  }));
 }
 
-export function getPlayersForAdmin(): AdminPlayerView[] {
-  const players = db.prepare(`
+export async function getPlayersForAdmin(): Promise<AdminPlayerView[]> {
+  await schemaInitialized;
+  const playersResult = await db.execute(`
     SELECT
       p.id,
       p.name,
@@ -74,69 +113,74 @@ export function getPlayersForAdmin(): AdminPlayerView[] {
     FROM players p
     LEFT JOIN players sp ON p.secret_player_id = sp.id
     ORDER BY p.name
-  `).all() as Array<{
-    id: number;
-    name: string;
-    pin: string;
-    has_assignment: number;
-    secret_player_name: string | null;
-  }>;
-
-  // Get incompatibilities for each player
-  const incompatStmt = db.prepare(`
-    SELECT p.id, p.name
-    FROM incompatibilities i
-    JOIN players p ON i.incompatible_with_id = p.id
-    WHERE i.player_id = ?
   `);
 
-  return players.map((p) => {
-    const incompats = incompatStmt.all(p.id) as { id: number; name: string }[];
-    return {
-      id: p.id,
-      name: p.name,
-      pin: p.pin,
-      has_assignment: p.has_assignment === 1,
-      secret_player_name: p.secret_player_name,
-      incompatible_ids: incompats.map((r) => r.id),
-      incompatible_names: incompats.map((r) => r.name),
-    };
-  });
+  const players: AdminPlayerView[] = [];
+
+  for (const row of playersResult.rows) {
+    const playerId = row.id as number;
+
+    // Get incompatibilities for this player
+    const incompatResult = await db.execute({
+      sql: `
+        SELECT p.id, p.name
+        FROM incompatibilities i
+        JOIN players p ON i.incompatible_with_id = p.id
+        WHERE i.player_id = ?
+      `,
+      args: [playerId],
+    });
+
+    players.push({
+      id: playerId,
+      name: row.name as string,
+      pin: row.pin as string,
+      has_assignment: (row.has_assignment as number) === 1,
+      secret_player_name: row.secret_player_name as string | null,
+      incompatible_ids: incompatResult.rows.map((r) => r.id as number),
+      incompatible_names: incompatResult.rows.map((r) => r.name as string),
+    });
+  }
+
+  return players;
 }
 
-export function createPlayer(
+export async function createPlayer(
   name: string,
   pin: string,
   incompatibleIds: number[]
-): Player {
-  const insertPlayer = db.prepare(
-    "INSERT INTO players (name, pin) VALUES (?, ?)"
-  );
-  const insertIncompat = db.prepare(
-    "INSERT INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)"
-  );
+): Promise<Player> {
+  await schemaInitialized;
 
-  const result = db.transaction(() => {
-    const info = insertPlayer.run(name, pin);
-    const playerId = info.lastInsertRowid as number;
+  const insertResult = await db.execute({
+    sql: "INSERT INTO players (name, pin) VALUES (?, ?)",
+    args: [name, pin],
+  });
 
-    // Insert bidirectional incompatibilities
-    for (const incompatId of incompatibleIds) {
-      insertIncompat.run(playerId, incompatId);
-      insertIncompat.run(incompatId, playerId);
-    }
+  const playerId = Number(insertResult.lastInsertRowid);
 
-    return getPlayerById(playerId)!;
-  })();
+  // Insert bidirectional incompatibilities
+  for (const incompatId of incompatibleIds) {
+    await db.execute({
+      sql: "INSERT INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
+      args: [playerId, incompatId],
+    });
+    await db.execute({
+      sql: "INSERT INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
+      args: [incompatId, playerId],
+    });
+  }
 
-  return result;
+  return (await getPlayerById(playerId))!;
 }
 
-export function updatePlayer(
+export async function updatePlayer(
   playerId: number,
   data: { name?: string; pin?: string }
-): { success: boolean; error?: string } {
-  if (data.pin && isPinTaken(data.pin, playerId)) {
+): Promise<{ success: boolean; error?: string }> {
+  await schemaInitialized;
+
+  if (data.pin && await isPinTaken(data.pin, playerId)) {
     return { success: false, error: "This PIN is already in use" };
   }
 
@@ -157,141 +201,165 @@ export function updatePlayer(
   }
 
   values.push(playerId);
-  const stmt = db.prepare(`UPDATE players SET ${updates.join(", ")} WHERE id = ?`);
-  stmt.run(...values);
+  await db.execute({
+    sql: `UPDATE players SET ${updates.join(", ")} WHERE id = ?`,
+    args: values,
+  });
 
   return { success: true };
 }
 
-export function updatePlayerIncompatibilities(
+export async function updatePlayerIncompatibilities(
   playerId: number,
   incompatibleIds: number[]
-): { success: boolean; error?: string } {
-  const deleteIncompat = db.prepare(
-    "DELETE FROM incompatibilities WHERE player_id = ? OR incompatible_with_id = ?"
-  );
-  const insertIncompat = db.prepare(
-    "INSERT OR IGNORE INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)"
-  );
+): Promise<{ success: boolean; error?: string }> {
+  await schemaInitialized;
 
-  db.transaction(() => {
-    // Remove all existing incompatibilities for this player
-    deleteIncompat.run(playerId, playerId);
+  // Remove all existing incompatibilities for this player
+  await db.execute({
+    sql: "DELETE FROM incompatibilities WHERE player_id = ? OR incompatible_with_id = ?",
+    args: [playerId, playerId],
+  });
 
-    // Insert new bidirectional incompatibilities
-    for (const incompatId of incompatibleIds) {
-      insertIncompat.run(playerId, incompatId);
-      insertIncompat.run(incompatId, playerId);
-    }
-  })();
+  // Insert new bidirectional incompatibilities
+  for (const incompatId of incompatibleIds) {
+    await db.execute({
+      sql: "INSERT OR IGNORE INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
+      args: [playerId, incompatId],
+    });
+    await db.execute({
+      sql: "INSERT OR IGNORE INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
+      args: [incompatId, playerId],
+    });
+  }
 
   return { success: true };
 }
 
-export function getPlayerIncompatibleIds(playerId: number): number[] {
-  const stmt = db.prepare(
-    "SELECT incompatible_with_id FROM incompatibilities WHERE player_id = ?"
-  );
-  return (stmt.all(playerId) as { incompatible_with_id: number }[]).map(
-    (r) => r.incompatible_with_id
-  );
+export async function getPlayerIncompatibleIds(playerId: number): Promise<number[]> {
+  await schemaInitialized;
+  const result = await db.execute({
+    sql: "SELECT incompatible_with_id FROM incompatibilities WHERE player_id = ?",
+    args: [playerId],
+  });
+  return result.rows.map((r) => r.incompatible_with_id as number);
 }
 
-export function deletePlayer(id: number): { success: boolean; error?: string } {
-  // Check if this player is assigned as someone's secret
-  const assignedTo = db.prepare(
-    "SELECT name FROM players WHERE secret_player_id = ?"
-  ).get(id) as { name: string } | undefined;
+export async function deletePlayer(id: number): Promise<{ success: boolean; error?: string }> {
+  await schemaInitialized;
 
-  if (assignedTo) {
+  // Check if this player is assigned as someone's secret
+  const assignedTo = await db.execute({
+    sql: "SELECT name FROM players WHERE secret_player_id = ?",
+    args: [id],
+  });
+
+  if (assignedTo.rows.length > 0) {
     return {
       success: false,
-      error: `Cannot delete: this player is assigned as ${assignedTo.name}'s secret santa`,
+      error: `Cannot delete: this player is assigned as ${assignedTo.rows[0].name}'s secret santa`,
     };
   }
 
-  // Delete player (incompatibilities will cascade)
-  const stmt = db.prepare("DELETE FROM players WHERE id = ?");
-  stmt.run(id);
+  // Delete incompatibilities first
+  await db.execute({
+    sql: "DELETE FROM incompatibilities WHERE player_id = ? OR incompatible_with_id = ?",
+    args: [id, id],
+  });
+
+  // Delete player
+  await db.execute({
+    sql: "DELETE FROM players WHERE id = ?",
+    args: [id],
+  });
 
   return { success: true };
 }
 
-export function isPinTaken(pin: string, excludeId?: number): boolean {
+export async function isPinTaken(pin: string, excludeId?: number): Promise<boolean> {
+  await schemaInitialized;
+
   if (excludeId) {
-    const stmt = db.prepare("SELECT 1 FROM players WHERE pin = ? AND id != ?");
-    return stmt.get(pin, excludeId) !== undefined;
+    const result = await db.execute({
+      sql: "SELECT 1 FROM players WHERE pin = ? AND id != ?",
+      args: [pin, excludeId],
+    });
+    return result.rows.length > 0;
   }
-  const stmt = db.prepare("SELECT 1 FROM players WHERE pin = ?");
-  return stmt.get(pin) !== undefined;
+
+  const result = await db.execute({
+    sql: "SELECT 1 FROM players WHERE pin = ?",
+    args: [pin],
+  });
+  return result.rows.length > 0;
 }
 
 // ============ Assignment Logic ============
 
-export function assignSecretSanta(playerId: number): {
+export async function assignSecretSanta(playerId: number): Promise<{
   success: boolean;
   secretPlayer?: Player;
   error?: string;
-} {
-  const getPlayer = db.prepare("SELECT * FROM players WHERE id = ?");
-  const getIncompatibleIds = db.prepare(
-    "SELECT incompatible_with_id FROM incompatibilities WHERE player_id = ?"
+}> {
+  await schemaInitialized;
+
+  const player = await getPlayerById(playerId);
+  if (!player) {
+    return { success: false, error: "Player not found" };
+  }
+
+  // Already assigned?
+  if (player.secret_player_id) {
+    const secretPlayer = await getPlayerById(player.secret_player_id);
+    return { success: true, secretPlayer: secretPlayer! };
+  }
+
+  // Get incompatible player IDs
+  const incompatibleIds = new Set(await getPlayerIncompatibleIds(playerId));
+
+  // Get available players (not yet assigned to anyone)
+  const availableResult = await db.execute({
+    sql: `
+      SELECT * FROM players
+      WHERE id NOT IN (
+        SELECT secret_player_id FROM players WHERE secret_player_id IS NOT NULL
+      )
+      AND id != ?
+    `,
+    args: [playerId],
+  });
+
+  const availablePlayers = availableResult.rows.map((row) => ({
+    id: row.id as number,
+    name: row.name as string,
+    pin: row.pin as string,
+    secret_player_id: row.secret_player_id as number | null,
+    created_at: row.created_at as string,
+  }));
+
+  // Filter out incompatible players
+  const eligiblePlayers = availablePlayers.filter(
+    (p) => !incompatibleIds.has(p.id)
   );
-  const getAvailablePlayers = db.prepare(`
-    SELECT * FROM players
-    WHERE id NOT IN (
-      SELECT secret_player_id FROM players WHERE secret_player_id IS NOT NULL
-    )
-    AND id != ?
-  `);
-  const updateAssignment = db.prepare(
-    "UPDATE players SET secret_player_id = ? WHERE id = ?"
-  );
 
-  const result = db.transaction(() => {
-    const player = getPlayer.get(playerId) as Player | undefined;
-    if (!player) {
-      return { success: false, error: "Player not found" };
-    }
+  if (eligiblePlayers.length === 0) {
+    return {
+      success: false,
+      error: "No compatible players available for assignment",
+    };
+  }
 
-    // Already assigned?
-    if (player.secret_player_id) {
-      const secretPlayer = getPlayer.get(player.secret_player_id) as Player;
-      return { success: true, secretPlayer };
-    }
+  // Randomly pick one
+  const randomIndex = Math.floor(Math.random() * eligiblePlayers.length);
+  const secretPlayer = eligiblePlayers[randomIndex];
 
-    // Get incompatible player IDs
-    const incompatibleIds = new Set(
-      (getIncompatibleIds.all(playerId) as { incompatible_with_id: number }[])
-        .map((r) => r.incompatible_with_id)
-    );
+  // Assign
+  await db.execute({
+    sql: "UPDATE players SET secret_player_id = ? WHERE id = ?",
+    args: [secretPlayer.id, playerId],
+  });
 
-    // Get available players (not yet assigned to anyone)
-    const availablePlayers = getAvailablePlayers.all(playerId) as Player[];
-
-    // Filter out incompatible players
-    const eligiblePlayers = availablePlayers.filter(
-      (p) => !incompatibleIds.has(p.id)
-    );
-
-    if (eligiblePlayers.length === 0) {
-      return {
-        success: false,
-        error: "No compatible players available for assignment",
-      };
-    }
-
-    // Randomly pick one
-    const randomIndex = Math.floor(Math.random() * eligiblePlayers.length);
-    const secretPlayer = eligiblePlayers[randomIndex];
-
-    // Assign
-    updateAssignment.run(secretPlayer.id, playerId);
-
-    return { success: true, secretPlayer };
-  })();
-
-  return result;
+  return { success: true, secretPlayer };
 }
 
 // ============ Admin Auth ============

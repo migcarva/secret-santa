@@ -12,7 +12,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const player = getPlayerByPin(pin);
+    const player = await getPlayerByPin(pin);
 
     if (!player) {
       return NextResponse.json(
