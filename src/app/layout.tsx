@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Secret Santa",
-  description: "Secret Santa Randomizer",
+  description: "Secret Santa Rodrigues 2025",
 };
 
 export default function RootLayout({
