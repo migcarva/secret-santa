@@ -229,11 +229,26 @@ export async function updatePlayerIncompatibilities(
   await ensureSchema();
   const client = getDb();
 
-  // Remove all existing incompatibilities for this player
-  await client.execute({
-    sql: "DELETE FROM incompatibilities WHERE player_id = ? OR incompatible_with_id = ?",
-    args: [playerId, playerId],
+  // Get current incompatibilities owned by this player
+  const currentResult = await client.execute({
+    sql: "SELECT incompatible_with_id FROM incompatibilities WHERE player_id = ?",
+    args: [playerId],
   });
+  const currentIds = currentResult.rows.map(r => r.incompatible_with_id as number);
+
+  // Remove only entries owned by this player (not entries from other players pointing to this one)
+  await client.execute({
+    sql: "DELETE FROM incompatibilities WHERE player_id = ?",
+    args: [playerId],
+  });
+
+  // Remove the reverse entries that this player created
+  for (const incompatId of currentIds) {
+    await client.execute({
+      sql: "DELETE FROM incompatibilities WHERE player_id = ? AND incompatible_with_id = ?",
+      args: [incompatId, playerId],
+    });
+  }
 
   // Insert new bidirectional incompatibilities
   for (const incompatId of incompatibleIds) {
