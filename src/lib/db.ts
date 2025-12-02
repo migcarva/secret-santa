@@ -1,21 +1,35 @@
-import { createClient } from "@libsql/client";
+import { createClient, type Client } from "@libsql/client";
 import type {
   Player,
   PlayerWithSecret,
   AdminPlayerView,
 } from "./types";
 
-// Create database client
-// For Turso: use TURSO_DATABASE_URL and TURSO_AUTH_TOKEN
-// For local: use file:./data/local.db
-const db = createClient({
-  url: process.env.TURSO_DATABASE_URL || "file:./data/local.db",
-  authToken: process.env.TURSO_AUTH_TOKEN,
-});
+// Lazy database connection - only connect when needed (not at build time)
+let db: Client | null = null;
+let schemaInitialized: Promise<void> | null = null;
+
+function getDb(): Client {
+  if (!db) {
+    db = createClient({
+      url: process.env.TURSO_DATABASE_URL || "file:./data/local.db",
+      authToken: process.env.TURSO_AUTH_TOKEN,
+    });
+  }
+  return db;
+}
+
+async function ensureSchema(): Promise<void> {
+  if (!schemaInitialized) {
+    schemaInitialized = initSchema();
+  }
+  return schemaInitialized;
+}
 
 // Initialize schema
 async function initSchema() {
-  await db.execute(`
+  const client = getDb();
+  await client.execute(`
     CREATE TABLE IF NOT EXISTS players (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
@@ -26,7 +40,7 @@ async function initSchema() {
     )
   `);
 
-  await db.execute(`
+  await client.execute(`
     CREATE TABLE IF NOT EXISTS incompatibilities (
       player_id INTEGER NOT NULL,
       incompatible_with_id INTEGER NOT NULL,
@@ -37,14 +51,11 @@ async function initSchema() {
   `);
 }
 
-// Initialize on first import
-const schemaInitialized = initSchema();
-
 // ============ Player Queries ============
 
 export async function getPlayerByPin(pin: string): Promise<PlayerWithSecret | null> {
-  await schemaInitialized;
-  const result = await db.execute({
+  await ensureSchema();
+  const result = await getDb().execute({
     sql: `
       SELECT
         p.*,
@@ -70,8 +81,8 @@ export async function getPlayerByPin(pin: string): Promise<PlayerWithSecret | nu
 }
 
 export async function getPlayerById(id: number): Promise<Player | null> {
-  await schemaInitialized;
-  const result = await db.execute({
+  await ensureSchema();
+  const result = await getDb().execute({
     sql: "SELECT * FROM players WHERE id = ?",
     args: [id],
   });
@@ -89,8 +100,8 @@ export async function getPlayerById(id: number): Promise<Player | null> {
 }
 
 export async function getAllPlayers(): Promise<Player[]> {
-  await schemaInitialized;
-  const result = await db.execute("SELECT * FROM players ORDER BY name");
+  await ensureSchema();
+  const result = await getDb().execute("SELECT * FROM players ORDER BY name");
 
   return result.rows.map((row) => ({
     id: row.id as number,
@@ -102,8 +113,9 @@ export async function getAllPlayers(): Promise<Player[]> {
 }
 
 export async function getPlayersForAdmin(): Promise<AdminPlayerView[]> {
-  await schemaInitialized;
-  const playersResult = await db.execute(`
+  await ensureSchema();
+  const client = getDb();
+  const playersResult = await client.execute(`
     SELECT
       p.id,
       p.name,
@@ -121,7 +133,7 @@ export async function getPlayersForAdmin(): Promise<AdminPlayerView[]> {
     const playerId = row.id as number;
 
     // Get incompatibilities for this player
-    const incompatResult = await db.execute({
+    const incompatResult = await client.execute({
       sql: `
         SELECT p.id, p.name
         FROM incompatibilities i
@@ -150,9 +162,10 @@ export async function createPlayer(
   pin: string,
   incompatibleIds: number[]
 ): Promise<Player> {
-  await schemaInitialized;
+  await ensureSchema();
+  const client = getDb();
 
-  const insertResult = await db.execute({
+  const insertResult = await client.execute({
     sql: "INSERT INTO players (name, pin) VALUES (?, ?)",
     args: [name, pin],
   });
@@ -161,11 +174,11 @@ export async function createPlayer(
 
   // Insert bidirectional incompatibilities
   for (const incompatId of incompatibleIds) {
-    await db.execute({
+    await client.execute({
       sql: "INSERT INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
       args: [playerId, incompatId],
     });
-    await db.execute({
+    await client.execute({
       sql: "INSERT INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
       args: [incompatId, playerId],
     });
@@ -178,7 +191,7 @@ export async function updatePlayer(
   playerId: number,
   data: { name?: string; pin?: string }
 ): Promise<{ success: boolean; error?: string }> {
-  await schemaInitialized;
+  await ensureSchema();
 
   if (data.pin && await isPinTaken(data.pin, playerId)) {
     return { success: false, error: "This PIN is already in use" };
@@ -201,7 +214,7 @@ export async function updatePlayer(
   }
 
   values.push(playerId);
-  await db.execute({
+  await getDb().execute({
     sql: `UPDATE players SET ${updates.join(", ")} WHERE id = ?`,
     args: values,
   });
@@ -213,21 +226,22 @@ export async function updatePlayerIncompatibilities(
   playerId: number,
   incompatibleIds: number[]
 ): Promise<{ success: boolean; error?: string }> {
-  await schemaInitialized;
+  await ensureSchema();
+  const client = getDb();
 
   // Remove all existing incompatibilities for this player
-  await db.execute({
+  await client.execute({
     sql: "DELETE FROM incompatibilities WHERE player_id = ? OR incompatible_with_id = ?",
     args: [playerId, playerId],
   });
 
   // Insert new bidirectional incompatibilities
   for (const incompatId of incompatibleIds) {
-    await db.execute({
+    await client.execute({
       sql: "INSERT OR IGNORE INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
       args: [playerId, incompatId],
     });
-    await db.execute({
+    await client.execute({
       sql: "INSERT OR IGNORE INTO incompatibilities (player_id, incompatible_with_id) VALUES (?, ?)",
       args: [incompatId, playerId],
     });
@@ -237,8 +251,8 @@ export async function updatePlayerIncompatibilities(
 }
 
 export async function getPlayerIncompatibleIds(playerId: number): Promise<number[]> {
-  await schemaInitialized;
-  const result = await db.execute({
+  await ensureSchema();
+  const result = await getDb().execute({
     sql: "SELECT incompatible_with_id FROM incompatibilities WHERE player_id = ?",
     args: [playerId],
   });
@@ -246,10 +260,11 @@ export async function getPlayerIncompatibleIds(playerId: number): Promise<number
 }
 
 export async function deletePlayer(id: number): Promise<{ success: boolean; error?: string }> {
-  await schemaInitialized;
+  await ensureSchema();
+  const client = getDb();
 
   // Check if this player is assigned as someone's secret
-  const assignedTo = await db.execute({
+  const assignedTo = await client.execute({
     sql: "SELECT name FROM players WHERE secret_player_id = ?",
     args: [id],
   });
@@ -262,13 +277,13 @@ export async function deletePlayer(id: number): Promise<{ success: boolean; erro
   }
 
   // Delete incompatibilities first
-  await db.execute({
+  await client.execute({
     sql: "DELETE FROM incompatibilities WHERE player_id = ? OR incompatible_with_id = ?",
     args: [id, id],
   });
 
   // Delete player
-  await db.execute({
+  await client.execute({
     sql: "DELETE FROM players WHERE id = ?",
     args: [id],
   });
@@ -277,17 +292,18 @@ export async function deletePlayer(id: number): Promise<{ success: boolean; erro
 }
 
 export async function isPinTaken(pin: string, excludeId?: number): Promise<boolean> {
-  await schemaInitialized;
+  await ensureSchema();
+  const client = getDb();
 
   if (excludeId) {
-    const result = await db.execute({
+    const result = await client.execute({
       sql: "SELECT 1 FROM players WHERE pin = ? AND id != ?",
       args: [pin, excludeId],
     });
     return result.rows.length > 0;
   }
 
-  const result = await db.execute({
+  const result = await client.execute({
     sql: "SELECT 1 FROM players WHERE pin = ?",
     args: [pin],
   });
@@ -301,7 +317,7 @@ export async function assignSecretSanta(playerId: number): Promise<{
   secretPlayer?: Player;
   error?: string;
 }> {
-  await schemaInitialized;
+  await ensureSchema();
 
   const player = await getPlayerById(playerId);
   if (!player) {
@@ -318,7 +334,7 @@ export async function assignSecretSanta(playerId: number): Promise<{
   const incompatibleIds = new Set(await getPlayerIncompatibleIds(playerId));
 
   // Get available players (not yet assigned to anyone)
-  const availableResult = await db.execute({
+  const availableResult = await getDb().execute({
     sql: `
       SELECT * FROM players
       WHERE id NOT IN (
@@ -354,7 +370,7 @@ export async function assignSecretSanta(playerId: number): Promise<{
   const secretPlayer = eligiblePlayers[randomIndex];
 
   // Assign
-  await db.execute({
+  await getDb().execute({
     sql: "UPDATE players SET secret_player_id = ? WHERE id = ?",
     args: [secretPlayer.id, playerId],
   });
@@ -368,5 +384,3 @@ export function verifyAdminPin(pin: string): boolean {
   const adminPin = process.env.ADMIN_PIN || "123456";
   return pin === adminPin;
 }
-
-export default db;
